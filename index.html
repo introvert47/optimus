@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Companion</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14171c;
+    --border: #262b33;
+    --text: #e6e9ee;
+    --dim: #8891a0;
+    --accent: #5fb4ff;
+    --accent-dim: #2a4a66;
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: env(safe-area-inset-top, 24px) 16px env(safe-area-inset-bottom, 16px);
+    min-height: 100%;
+  }
+
+  .orb-wrap {
+    width: 220px;
+    height: 220px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 12px 0 8px;
+    flex-shrink: 0;
+  }
+  canvas#orb { width: 220px; height: 220px; }
+
+  .status {
+    font-size: 12px;
+    color: var(--dim);
+    margin-bottom: 18px;
+    min-height: 16px;
+    text-align: center;
+  }
+  .status.speaking { color: var(--accent); }
+  .status.error { color: var(--err); }
+
+  #log {
+    width: 100%;
+    max-width: 560px;
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding-bottom: 12px;
+  }
+  .turn { font-size: 14px; line-height: 1.55; }
+  .turn .who { color: var(--dim); font-size: 10.5px; margin-bottom: 2px; text-transform: lowercase; }
+  .turn.user .who { color: var(--accent); }
+
+  .inputBar {
+    width: 100%;
+    max-width: 560px;
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 8px;
+    flex-shrink: 0;
+  }
+  textarea#userInput {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 14px;
+    resize: none;
+    padding: 8px;
+    max-height: 120px;
+  }
+  textarea#userInput:focus { outline: none; }
+
+  button {
+    background: var(--accent-dim);
+    color: var(--text);
+    border: none;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  button:hover { background: #335a7a; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #sendBtn { background: var(--accent); color: #06131f; font-weight: 600; }
+  #sendBtn:hover { background: #7cc2ff; }
+  #micBtn.listening { background: var(--err); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+  .toolbar {
+    width: 100%;
+    max-width: 560px;
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    margin-top: 8px;
+    flex-shrink: 0;
+  }
+  .toolbar button { background: transparent; color: var(--dim); font-size: 11px; padding: 6px 10px; }
+  .toolbar button.off { color: var(--err); }
+</style>
+</head>
+<body>
+
+<div class="orb-wrap"><canvas id="orb" width="220" height="220"></canvas></div>
+<div class="status" id="status">idle</div>
+
+<div id="log"></div>
+
+<div class="inputBar">
+  <button id="micBtn" title="Click to talk">🎤</button>
+  <textarea id="userInput" rows="1" placeholder="say something"></textarea>
+  <button id="sendBtn">Send</button>
+</div>
+
+<div class="toolbar">
+  <button id="speakToggle">🔊 voice: on</button>
+  <button id="clearViewBtn">clear view</button>
+</div>
+
+<script>
+// ============================================================
+// Point this at your deployed worker URL.
+// APP_SECRET must match what you set with `wrangler secret put APP_SECRET`.
+// NOTE: anyone who views this page's source can see APP_SECRET — fine for
+// a personal/private deployment, but don't treat it as a real secret if
+// you ever make the URL public.
+// ============================================================
+const WORKER_URL = 'https://companion-backend.hn3156259.workers.dev';
+const FISH_VOICE = 'f8dfe9c83081432386f143e2fe9767ef'; // "Book Record Regular" voice
+
+let APP_SECRET = '';
+while (!APP_SECRET) {
+  const entered = prompt('Password:');
+  if (entered === null) continue; // keep asking — no way into the app without it
+  if (entered.trim()) APP_SECRET = entered.trim();
+}
+
+// ---------- orb ----------
+const canvas = document.getElementById('orb');
+const ctx = canvas.getContext('2d');
+let orbState = 'idle'; // idle | thinking | speaking
+let orbLevel = 0;
+let thinkingPhase = 0;
+
+function drawOrb() {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2, cy = h / 2;
+  let radius = 48;
+  let color = '#3a4250';
+
+  if (orbState === 'thinking') {
+    thinkingPhase += 0.06;
+    radius = 48 + Math.sin(thinkingPhase) * 7;
+    color = '#5fb4ff';
+  } else if (orbState === 'speaking') {
+    radius = 48 + orbLevel * 55;
+    color = '#7cc2ff';
+  } else {
+    thinkingPhase = 0;
+  }
+
+  const grad = ctx.createRadialGradient(cx, cy, radius * 0.2, cx, cy, radius);
+  grad.addColorStop(0, color);
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.9;
+  ctx.arc(cx, cy, radius * 0.35, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  requestAnimationFrame(drawOrb);
+}
+drawOrb();
+
+function setStatus(text, cls) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = 'status' + (cls ? ' ' + cls : '');
+}
+
+// ---------- audio playback ----------
+let audioCtx = null;
+let analyser = null;
+let playQueue = [];
+let playing = false;
+
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.connect(audioCtx.destination);
+  }
+}
+
+function levelLoop() {
+  if (orbState === 'speaking' && analyser) {
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(data);
+    const avg = data.reduce((a, b) => a + b, 0) / data.length;
+    orbLevel = Math.min(1, avg / 90);
+  }
+  requestAnimationFrame(levelLoop);
+}
+levelLoop();
+
+function enqueueAudio(blobUrl) {
+  playQueue.push(blobUrl);
+  if (!playing) playNext();
+}
+
+function playNext() {
+  if (playQueue.length === 0) {
+    playing = false;
+    orbState = 'idle';
+    setStatus('idle');
+    return;
+  }
+  playing = true;
+  orbState = 'speaking';
+  setStatus('speaking', 'speaking');
+  ensureAudioCtx();
+  const url = playQueue.shift();
+  const audioEl = new Audio(url);
+  const src = audioCtx.createMediaElementSource(audioEl);
+  src.connect(analyser);
+  audioEl.onended = () => { URL.revokeObjectURL(url); playNext(); };
+  audioEl.onerror = () => { playNext(); };
+  audioEl.play().catch(() => playNext());
+}
+
+// ---------- speak on/off ----------
+let voiceOn = localStorage.getItem('voiceOn') !== 'false';
+function renderSpeakToggle() {
+  const btn = document.getElementById('speakToggle');
+  btn.textContent = voiceOn ? '🔊 voice: on' : '🔇 voice: off';
+  btn.classList.toggle('off', !voiceOn);
+}
+renderSpeakToggle();
+document.getElementById('speakToggle').onclick = () => {
+  voiceOn = !voiceOn;
+  localStorage.setItem('voiceOn', String(voiceOn));
+  renderSpeakToggle();
+  if (!voiceOn) playQueue = [];
+};
+
+// ---------- hedge-phrase filter ----------
+const HEDGES = [
+  /as an ai[^.!?]*[.!?]/gi,
+  /i don'?t have (personal )?(feelings|experiences|opinions)[^.!?]*[.!?]/gi,
+  /it'?s worth noting that/gi,
+  /keep in mind that/gi,
+  /it'?s important to note that/gi,
+  /i'?m just an ai[^.!?]*[.!?]/gi,
+];
+function stripHedges(text) {
+  let out = text;
+  for (const re of HEDGES) out = out.replace(re, '');
+  return out.replace(/\s{2,}/g, ' ').trim();
+}
+
+// ---------- TTS via worker ----------
+async function speakSentence(sentence) {
+  if (!voiceOn) return;
+  const clean = stripHedges(sentence);
+  if (!clean) return;
+
+  const body = { text: clean, format: 'mp3' };
+  if (FISH_VOICE) body.reference_id = FISH_VOICE;
+
+  try {
+    const res = await fetch(WORKER_URL + '/api/tts', {
+      method: 'POST',
+      headers: { 'x-api-secret': APP_SECRET, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('TTS ' + res.status);
+    const blob = await res.blob();
+    enqueueAudio(URL.createObjectURL(blob));
+  } catch (e) {
+    console.error(e);
+    setStatus('voice error — see console', 'error');
+  }
+}
+
+// ---------- chat ----------
+function appendTurn(who, text, cls) {
+  const log = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = 'turn ' + cls;
+  div.innerHTML = '<div class="who">' + who + '</div><div class="text"></div>';
+  div.querySelector('.text').textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div.querySelector('.text');
+}
+
+const SENTENCE_END = /[.!?]+[\s"')\]]*$/;
+
+async function sendMessage() {
+  const input = document.getElementById('userInput');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  input.style.height = 'auto';
+  appendTurn('you', text, 'user');
+
+  const replyEl = appendTurn('it', '', 'reply');
+  orbState = 'thinking';
+  setStatus('thinking…');
+
+  let fullText = '';
+  let sentenceBuf = '';
+
+  try {
+    const res = await fetch(WORKER_URL + '/api/chat', {
+      method: 'POST',
+      headers: { 'x-api-secret': APP_SECRET, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text }),
+    });
+    if (!res.ok) { const t = await res.text(); throw new Error('chat ' + res.status + ': ' + t.slice(0, 200)); }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const jsonStr = line.slice(6);
+        if (!jsonStr) continue;
+        try {
+          const chunk = JSON.parse(jsonStr);
+          const piece = chunk?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (piece) {
+            fullText += piece;
+            sentenceBuf += piece;
+            replyEl.textContent = fullText;
+            if (SENTENCE_END.test(sentenceBuf.trim())) {
+              const toSpeak = sentenceBuf.trim();
+              sentenceBuf = '';
+              speakSentence(toSpeak);
+            }
+          }
+        } catch (e) { /* partial line */ }
+      }
+    }
+    if (sentenceBuf.trim()) speakSentence(sentenceBuf.trim());
+    if (playQueue.length === 0 && !playing) { orbState = 'idle'; setStatus('idle'); }
+
+  } catch (e) {
+    console.error(e);
+    replyEl.textContent = fullText || ('[error: ' + e.message + ']');
+    setStatus(e.message, 'error');
+    orbState = 'idle';
+  }
+}
+
+document.getElementById('sendBtn').onclick = sendMessage;
+const inputEl = document.getElementById('userInput');
+inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+});
+
+document.getElementById('clearViewBtn').onclick = () => {
+  document.getElementById('log').innerHTML = '';
+  setStatus('view cleared (memory on the server is untouched)');
+  setTimeout(() => setStatus('idle'), 1800);
+};
+
+// ---------- voice input ----------
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognizer = null;
+let listening = false;
+
+if (SpeechRecognition) {
+  recognizer = new SpeechRecognition();
+  recognizer.continuous = false;
+  recognizer.interimResults = true;
+  recognizer.lang = 'en-US';
+
+  recognizer.onstart = () => {
+    listening = true;
+    document.getElementById('micBtn').classList.add('listening');
+    setStatus('listening…');
+  };
+  recognizer.onresult = (e) => {
+    let transcript = '';
+    for (let i = 0; i < e.results.length; i++) transcript += e.results[i][0].transcript;
+    document.getElementById('userInput').value = transcript;
+  };
+  recognizer.onerror = (e) => setStatus('mic error: ' + e.error, 'error');
+  recognizer.onend = () => {
+    listening = false;
+    document.getElementById('micBtn').classList.remove('listening');
+    if (orbState === 'idle') setStatus('idle');
+  };
+
+  document.getElementById('micBtn').onclick = () => {
+    if (listening) { recognizer.stop(); return; }
+    document.getElementById('userInput').value = '';
+    recognizer.start();
+  };
+} else {
+  document.getElementById('micBtn').disabled = true;
+  document.getElementById('micBtn').title = 'Voice input not supported — try Chrome';
+}
+</script>
+</body>
+</html>
