@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Companion</title>
+<title>Optimus</title>
 <style>
   :root {
     --bg: #0b0d10;
@@ -219,7 +219,20 @@ function ensureAudioCtx() {
     analyser.fftSize = 256;
     analyser.connect(audioCtx.destination);
   }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
 }
+
+// Browsers block audio until a real user gesture happens — the automatic
+// on-load greeting isn't one, so it can leave the AudioContext silently
+// suspended even for messages typed afterward. Unlock it on the first
+// click/keypress/touch, whatever it is.
+['click', 'keydown', 'touchstart'].forEach((evt) => {
+  document.addEventListener(evt, () => {
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  }, { once: true });
+});
 
 function levelLoop() {
   if (orbState === 'speaking' && analyser) {
@@ -232,29 +245,73 @@ function levelLoop() {
 }
 levelLoop();
 
-function enqueueAudio(blobUrl) {
-  playQueue.push(blobUrl);
+function enqueueAudio(bodyStream) {
+  playQueue.push(bodyStream);
   if (!playing) playNext();
 }
 
 function playNext() {
   if (playQueue.length === 0) {
     playing = false;
-    orbState = 'idle';
-    setStatus('idle');
+    maybeGoIdle();
     return;
   }
   playing = true;
   orbState = 'speaking';
   setStatus('speaking', 'speaking');
   ensureAudioCtx();
-  const url = playQueue.shift();
-  const audioEl = new Audio(url);
+
+  const bodyStream = playQueue.shift();
+  const mediaSource = new MediaSource();
+  const audioEl = new Audio();
+  audioEl.src = URL.createObjectURL(mediaSource);
   const src = audioCtx.createMediaElementSource(audioEl);
   src.connect(analyser);
-  audioEl.onended = () => { URL.revokeObjectURL(url); playNext(); };
-  audioEl.onerror = () => { playNext(); };
-  audioEl.play().catch(() => playNext());
+
+  const advance = () => { URL.revokeObjectURL(audioEl.src); playNext(); };
+  audioEl.onended = advance;
+  audioEl.onerror = advance;
+
+  mediaSource.addEventListener('sourceopen', async () => {
+    let sourceBuffer;
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+    } catch (e) {
+      console.error('MediaSource unsupported for audio/mpeg', e);
+      advance();
+      return;
+    }
+    const reader = bodyStream.getReader();
+    audioEl.play().catch((err) => {
+      // If the browser blocks autoplay (common for the very first sound on
+      // a freshly loaded page), don't leave the queue stuck thinking this
+      // is still "playing" forever — move on.
+      console.warn('Playback blocked, skipping:', err.message);
+      advance();
+    });
+
+    async function pump() {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch (e) {}
+          }
+          return;
+        }
+        await new Promise((resolve, reject) => {
+          sourceBuffer.addEventListener('updateend', resolve, { once: true });
+          sourceBuffer.addEventListener('error', reject, { once: true });
+          sourceBuffer.appendBuffer(value);
+        });
+        pump();
+      } catch (e) {
+        console.error('TTS playback stream error', e);
+        advance(); // don't let a failed chunk stall the queue forever
+      }
+    }
+    pump();
+  });
 }
 
 // ---------- speak on/off ----------
@@ -288,12 +345,22 @@ function stripHedges(text) {
 }
 
 // ---------- TTS via worker ----------
+let pendingSpeaks = 0;
+
+function maybeGoIdle() {
+  if (pendingSpeaks === 0 && playQueue.length === 0 && !playing) {
+    orbState = 'idle';
+    setStatus('idle');
+  }
+}
+
 async function speakSentence(sentence) {
   if (!voiceOn) return;
   const clean = stripHedges(sentence);
   if (!clean) return;
 
-  const body = { text: clean, format: 'mp3' };
+  pendingSpeaks++;
+  const body = { text: clean, format: 'mp3', latency: 'balanced' };
   if (FISH_VOICE) body.reference_id = FISH_VOICE;
 
   try {
@@ -302,12 +369,14 @@ async function speakSentence(sentence) {
       headers: { 'x-api-secret': APP_SECRET, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error('TTS ' + res.status);
-    const blob = await res.blob();
-    enqueueAudio(URL.createObjectURL(blob));
+    if (!res.ok || !res.body) throw new Error('TTS ' + res.status);
+    enqueueAudio(res.body);
   } catch (e) {
     console.error(e);
     setStatus('voice error — see console', 'error');
+  } finally {
+    pendingSpeaks--;
+    maybeGoIdle();
   }
 }
 
@@ -317,13 +386,71 @@ function appendTurn(who, text, cls) {
   const div = document.createElement('div');
   div.className = 'turn ' + cls;
   div.innerHTML = '<div class="who">' + who + '</div><div class="text"></div>';
-  div.querySelector('.text').textContent = text;
+  const textEl = div.querySelector('.text');
+  textEl.textContent = text;
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
-  return div.querySelector('.text');
+  return textEl;
 }
 
 const SENTENCE_END = /[.!?]+[\s"')\]]*$/;
+const COMMA_PAUSE = /[,;:]\s*$/;
+
+// Streams a reply from `endpoint`, updating replyEl live and speaking chunks
+// as they complete. The very first chunk flushes early (on a comma, or once
+// it's long enough) instead of waiting for a full sentence — cuts the delay
+// before it starts talking.
+async function streamReply(endpoint, bodyObj, replyEl) {
+  let fullText = '';
+  let chunkBuf = '';
+  let firstFlushed = false;
+
+  const res = await fetch(WORKER_URL + endpoint, {
+    method: 'POST',
+    headers: { 'x-api-secret': APP_SECRET, 'Content-Type': 'application/json' },
+    body: JSON.stringify(bodyObj),
+  });
+  if (!res.ok) { const t = await res.text(); throw new Error(endpoint + ' ' + res.status + ': ' + t.slice(0, 200)); }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const jsonStr = line.slice(6);
+      if (!jsonStr) continue;
+      try {
+        const chunk = JSON.parse(jsonStr);
+        const piece = chunk?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!piece) continue;
+        fullText += piece;
+        chunkBuf += piece;
+        replyEl.textContent = fullText;
+
+        const trimmed = chunkBuf.trim();
+        const readyBySentence = SENTENCE_END.test(trimmed);
+        const readyByFirstFlush = !firstFlushed && (COMMA_PAUSE.test(trimmed) || trimmed.length >= 40);
+
+        if (readyBySentence || readyByFirstFlush) {
+          firstFlushed = true;
+          const toSpeak = trimmed;
+          chunkBuf = '';
+          speakSentence(toSpeak);
+        }
+      } catch (e) { /* partial line */ }
+    }
+  }
+  if (chunkBuf.trim()) speakSentence(chunkBuf.trim());
+  maybeGoIdle();
+  return fullText;
+}
 
 async function sendMessage() {
   const input = document.getElementById('userInput');
@@ -337,57 +464,30 @@ async function sendMessage() {
   orbState = 'thinking';
   setStatus('thinking…');
 
-  let fullText = '';
-  let sentenceBuf = '';
-
   try {
-    const res = await fetch(WORKER_URL + '/api/chat', {
-      method: 'POST',
-      headers: { 'x-api-secret': APP_SECRET, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text }),
-    });
-    if (!res.ok) { const t = await res.text(); throw new Error('chat ' + res.status + ': ' + t.slice(0, 200)); }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const jsonStr = line.slice(6);
-        if (!jsonStr) continue;
-        try {
-          const chunk = JSON.parse(jsonStr);
-          const piece = chunk?.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (piece) {
-            fullText += piece;
-            sentenceBuf += piece;
-            replyEl.textContent = fullText;
-            if (SENTENCE_END.test(sentenceBuf.trim())) {
-              const toSpeak = sentenceBuf.trim();
-              sentenceBuf = '';
-              speakSentence(toSpeak);
-            }
-          }
-        } catch (e) { /* partial line */ }
-      }
-    }
-    if (sentenceBuf.trim()) speakSentence(sentenceBuf.trim());
-    if (playQueue.length === 0 && !playing) { orbState = 'idle'; setStatus('idle'); }
-
+    await streamReply('/api/chat', { message: text }, replyEl);
   } catch (e) {
     console.error(e);
-    replyEl.textContent = fullText || ('[error: ' + e.message + ']');
+    replyEl.textContent = replyEl.textContent || ('[error: ' + e.message + ']');
     setStatus(e.message, 'error');
     orbState = 'idle';
   }
 }
+
+async function greetOnLoad() {
+  const replyEl = appendTurn('it', '', 'reply');
+  orbState = 'thinking';
+  setStatus('thinking…');
+  try {
+    await streamReply('/api/greet', {}, replyEl);
+  } catch (e) {
+    console.error(e);
+    replyEl.parentElement.remove(); // silent fail — just don't show a broken empty turn
+    orbState = 'idle';
+    setStatus('idle');
+  }
+}
+greetOnLoad();
 
 document.getElementById('sendBtn').onclick = sendMessage;
 const inputEl = document.getElementById('userInput');
