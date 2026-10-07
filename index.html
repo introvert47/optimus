@@ -479,15 +479,47 @@ async function greetOnLoad() {
   orbState = 'thinking';
   setStatus('thinking…');
   try {
-    await streamReply('/api/greet', {}, replyEl);
+    await streamReply('/api/greet', { reason: 'open' }, replyEl);
   } catch (e) {
     console.error(e);
     replyEl.parentElement.remove(); // silent fail — just don't show a broken empty turn
     orbState = 'idle';
     setStatus('idle');
   }
+  lastActivity = Date.now();
 }
 greetOnLoad();
+
+// ---------- idle check-in (app open, you've gone quiet) ----------
+const IDLE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes of no activity
+let lastActivity = Date.now();
+let idleFired = false;
+
+function markActivity() {
+  lastActivity = Date.now();
+  idleFired = false;
+}
+['click', 'keydown', 'touchstart'].forEach((evt) => document.addEventListener(evt, markActivity));
+
+async function checkIdle() {
+  const nothingInFlight = orbState === 'idle' && pendingSpeaks === 0 && !playing;
+  if (!idleFired && nothingInFlight && Date.now() - lastActivity >= IDLE_THRESHOLD_MS) {
+    idleFired = true;
+    lastActivity = Date.now(); // counts as "activity" so it waits a full interval before firing again
+    const replyEl = appendTurn('it', '', 'reply');
+    orbState = 'thinking';
+    setStatus('thinking…');
+    try {
+      await streamReply('/api/greet', { reason: 'idle' }, replyEl);
+    } catch (e) {
+      console.error(e);
+      replyEl.parentElement.remove();
+      orbState = 'idle';
+      setStatus('idle');
+    }
+  }
+}
+setInterval(checkIdle, 30000);
 
 document.getElementById('sendBtn').onclick = sendMessage;
 const inputEl = document.getElementById('userInput');
