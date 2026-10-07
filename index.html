@@ -491,21 +491,18 @@ async function greetOnLoad() {
 greetOnLoad();
 
 // ---------- idle check-in (app open, you've gone quiet) ----------
-const IDLE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes of no activity
+const IDLE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes of no activity — repeats for as long as you stay silent
 let lastActivity = Date.now();
-let idleFired = false;
 
 function markActivity() {
   lastActivity = Date.now();
-  idleFired = false;
 }
 ['click', 'keydown', 'touchstart'].forEach((evt) => document.addEventListener(evt, markActivity));
 
 async function checkIdle() {
   const nothingInFlight = orbState === 'idle' && pendingSpeaks === 0 && !playing;
-  if (!idleFired && nothingInFlight && Date.now() - lastActivity >= IDLE_THRESHOLD_MS) {
-    idleFired = true;
-    lastActivity = Date.now(); // counts as "activity" so it waits a full interval before firing again
+  if (nothingInFlight && Date.now() - lastActivity >= IDLE_THRESHOLD_MS) {
+    lastActivity = Date.now(); // its own check-in counts as activity, so the next one is a fresh 5-min wait
     const replyEl = appendTurn('it', '', 'reply');
     orbState = 'thinking';
     setStatus('thinking…');
