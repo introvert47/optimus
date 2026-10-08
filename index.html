@@ -146,7 +146,7 @@
 <div id="attachPreview" style="display:none;"></div>
 <div class="inputBar">
   <button id="attachBtn" title="Attach an image or PDF">📎</button>
-  <input type="file" id="fileInput" accept="image/*,application/pdf" style="display:none;">
+  <input type="file" id="fileInput" accept="image/*,video/*,audio/*,application/pdf,text/*,.js,.jsx,.ts,.tsx,.py,.json,.md,.c,.cpp,.h,.java,.go,.rs,.html,.css,.sql,.yaml,.yml,.sh,.txt" style="display:none;">
   <button id="micBtn" title="Click to talk">🎤</button>
   <textarea id="userInput" rows="1" placeholder="say something"></textarea>
   <button id="sendBtn">Send</button>
@@ -495,7 +495,8 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
   const reader = new FileReader();
   reader.onload = () => {
     const base64 = reader.result.split(',')[1]; // strip the data: URL prefix
-    pendingAttachment = { mimeType: file.type, data: base64, name: file.name };
+    const mimeType = file.type || 'text/plain'; // browsers often report no type for code files
+    pendingAttachment = { mimeType, data: base64, name: file.name };
     renderAttachPreview();
   };
   reader.readAsDataURL(file);
