@@ -118,6 +118,22 @@
   }
   .toolbar button { background: transparent; color: var(--dim); font-size: 11px; padding: 6px 10px; }
   .toolbar button.off { color: var(--err); }
+
+  #attachPreview {
+    width: 100%;
+    max-width: 560px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin-bottom: 6px;
+    font-size: 12px;
+    color: var(--dim);
+  }
+  #attachPreview button { background: transparent; color: var(--err); padding: 0 4px; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -127,7 +143,10 @@
 
 <div id="log"></div>
 
+<div id="attachPreview" style="display:none;"></div>
 <div class="inputBar">
+  <button id="attachBtn" title="Attach an image or PDF">📎</button>
+  <input type="file" id="fileInput" accept="image/*,application/pdf" style="display:none;">
   <button id="micBtn" title="Click to talk">🎤</button>
   <textarea id="userInput" rows="1" placeholder="say something"></textarea>
   <button id="sendBtn">Send</button>
@@ -452,20 +471,57 @@ async function streamReply(endpoint, bodyObj, replyEl) {
   return fullText;
 }
 
+// ---------- file attachment ----------
+let pendingAttachment = null; // { mimeType, data (base64, no prefix), name }
+const MAX_ATTACHMENT_MB = 15;
+
+function renderAttachPreview() {
+  const box = document.getElementById('attachPreview');
+  if (!pendingAttachment) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  box.style.display = 'flex';
+  box.innerHTML = '<span>📎 ' + pendingAttachment.name + '</span><button id="removeAttachBtn">✕</button>';
+  document.getElementById('removeAttachBtn').onclick = () => { pendingAttachment = null; renderAttachPreview(); };
+}
+
+document.getElementById('attachBtn').onclick = () => document.getElementById('fileInput').click();
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  e.target.value = ''; // allow re-selecting the same file later
+  if (!file) return;
+  if (file.size > MAX_ATTACHMENT_MB * 1024 * 1024) {
+    setStatus('file too large (max ' + MAX_ATTACHMENT_MB + 'MB)', 'error');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const base64 = reader.result.split(',')[1]; // strip the data: URL prefix
+    pendingAttachment = { mimeType: file.type, data: base64, name: file.name };
+    renderAttachPreview();
+  };
+  reader.readAsDataURL(file);
+});
+
 async function sendMessage() {
   const input = document.getElementById('userInput');
   const text = input.value.trim();
-  if (!text) return;
+  const attachment = pendingAttachment;
+  if (!text && !attachment) return;
   input.value = '';
   input.style.height = 'auto';
-  appendTurn('you', text, 'user');
+
+  const shownText = attachment ? (text ? text + '  📎 ' + attachment.name : '📎 ' + attachment.name) : text;
+  appendTurn('you', shownText, 'user');
+  pendingAttachment = null;
+  renderAttachPreview();
 
   const replyEl = appendTurn('it', '', 'reply');
   orbState = 'thinking';
   setStatus('thinking…');
 
   try {
-    await streamReply('/api/chat', { message: text }, replyEl);
+    const body = { message: text };
+    if (attachment) body.attachment = { mimeType: attachment.mimeType, data: attachment.data };
+    await streamReply('/api/chat', body, replyEl);
   } catch (e) {
     console.error(e);
     replyEl.textContent = replyEl.textContent || ('[error: ' + e.message + ']');
