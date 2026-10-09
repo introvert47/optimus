@@ -564,7 +564,12 @@ async function checkIdle() {
     orbState = 'thinking';
     setStatus('thinking…');
     try {
-      await streamReply('/api/greet', { reason: 'idle' }, replyEl);
+      const fullText = await streamReply('/api/greet', { reason: 'idle' }, replyEl);
+      if (!fullText || !fullText.trim()) {
+        replyEl.parentElement.remove(); // chose silence — no empty bubble left behind
+        orbState = 'idle';
+        setStatus('idle');
+      }
     } catch (e) {
       console.error(e);
       replyEl.parentElement.remove();
